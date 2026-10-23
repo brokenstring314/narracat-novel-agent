@@ -60,7 +60,7 @@ export interface CharacterChatStore {
   conversations: Record<string, CharacterChatConversation>
   /** runId → character_uid 路由表（流事件回填用）。 */
   runRouting: Record<string, string>
-  /** 已从本机存档恢复过的 character_uid（避免重复 restore 覆盖在途消息）。 */
+  /** 磁盘历史已读回并合并进内存的 character_uid。未在此列表中的联系人不落盘（避免整份覆盖磁盘历史）。 */
   hydratedUids: string[]
 
   setProjectPath: (projectPath: string | null) => void
@@ -173,10 +173,31 @@ function finalizeBubbleRun(runId: string): void {
     },
     runRouting,
   })
-  const projectPath = useCharacterChatStore.getState().projectPath
-  if (projectPath) {
-    persistTranscript(projectPath, characterUid, useCharacterChatStore.getState().conversations[characterUid].messages)
-  }
+  persistIfHydrated(characterUid)
+}
+
+/**
+ * 只在该联系人的磁盘历史已并入内存后才落盘。
+ *
+ * 主进程 save 是整份覆盖写（character-chat-transcripts.ts 不做合并）：历史还没读回来（读取在途或
+ * 读取失败）时内存里只有本次新发的几条，此时落盘会把磁盘上的旧历史整份抹掉。未 hydrate 时跳过，
+ * 等 restoreTranscript 读回、合并后再由它补一次落盘。
+ */
+function persistIfHydrated(characterUid: string): void {
+  const state = useCharacterChatStore.getState()
+  if (!state.projectPath || !state.hydratedUids.includes(characterUid)) return
+  const conversation = state.conversations[characterUid]
+  if (!conversation) return
+  persistTranscript(state.projectPath, characterUid, conversation.messages)
+}
+
+/** 磁盘历史在前、内存里新发的在后；按 id 去重（重复 restore 或内存已含某条时不重复）。 */
+function mergeTranscriptMessages(
+  diskMessages: CharacterChatMessage[],
+  memoryMessages: CharacterChatMessage[],
+): CharacterChatMessage[] {
+  const diskIds = new Set(diskMessages.map((message) => message.id))
+  return [...diskMessages, ...memoryMessages.filter((message) => !diskIds.has(message.id))]
 }
 
 /** 逐条把队列里的气泡按停顿上屏；队列空且已 completed 则收尾。 */
@@ -284,7 +305,7 @@ export const useCharacterChatStore = create<CharacterChatStore>((set, get) => ({
       })
 
       // 默认/保留选中的联系人也要恢复历史：否则重开板块时默认角色看似无历史，
-      // 必须手动切换才加载（#202 回归）。restoreTranscript 自带 hydratedUids/在途守卫，
+      // 必须手动切换才加载（#202 回归）。restoreTranscript 自带 hydratedUids 守卫，读回后与在途/本地消息合并，
       // 不会覆盖在途消息或重复 restore。
       if (nextActiveCharacterUid) void get().restoreTranscript(nextActiveCharacterUid)
 
@@ -340,39 +361,38 @@ export const useCharacterChatStore = create<CharacterChatStore>((set, get) => ({
   },
 
   restoreTranscript: async (characterUid) => {
-    const { projectPath, hydratedUids, conversations } = get()
+    const { projectPath, hydratedUids } = get()
     if (!projectPath) return
-    // 已恢复过，或已有在途/本地消息，则不覆盖（避免抹掉用户刚发的内容）。
     if (hydratedUids.includes(characterUid)) return
-    const existing = conversations[characterUid]
-    if (existing && (existing.messages.length > 0 || existing.activeRunId)) {
-      set({ hydratedUids: [...hydratedUids, characterUid] })
+
+    let transcript: Awaited<ReturnType<typeof readCharacterChatTranscript>>
+    try {
+      transcript = await readCharacterChatTranscript({ projectPath, characterUid, userMode: MVP_USER_MODE })
+    } catch (error) {
+      // 读取失败不标记已恢复：否则之后发消息会以「只有新消息」的内容整份覆盖磁盘历史。
+      // 保持未 hydrate → 不落盘；下次选中该联系人会再读一次并合并。出声而不是静默：
+      // 存档损坏（JSON 解析失败）时该联系人的新回合会一直不入档，需要能在日志里看到原因。
+      console.warn('[character-chat] 读取聊天存档失败，本联系人暂不落盘以免覆盖历史：', errorMessage(error))
       return
     }
+    // 恢复期间项目切换则放弃回填；并发的另一次 restore 已完成则不重复合并。
+    if (get().projectPath !== projectPath || get().hydratedUids.includes(characterUid)) return
 
-    try {
-      const transcript = await readCharacterChatTranscript({ projectPath, characterUid, userMode: MVP_USER_MODE })
-      // 恢复期间项目切换或已有在途消息则放弃回填。
-      if (get().projectPath !== projectPath) return
-      const current = get().conversations[characterUid]
-      if (current && (current.messages.length > 0 || current.activeRunId)) {
-        set({ hydratedUids: [...get().hydratedUids, characterUid] })
-        return
-      }
-      set({
-        conversations: {
-          ...get().conversations,
-          [characterUid]: {
-            messages: transcript.messages,
-            activeRunId: null,
-            lastUserMessage: null,
-          },
+    // 读取在途期间用户可能已经发了消息（开场快捷语一点即发）：把磁盘历史并在前面，而不是丢掉。
+    const current = get().conversations[characterUid] ?? emptyConversation()
+    set({
+      conversations: {
+        ...get().conversations,
+        [characterUid]: {
+          ...current,
+          messages: mergeTranscriptMessages(transcript.messages, current.messages),
         },
-        hydratedUids: [...get().hydratedUids, characterUid],
-      })
-    } catch {
-      set({ hydratedUids: [...get().hydratedUids, characterUid] })
-    }
+      },
+      hydratedUids: [...get().hydratedUids, characterUid],
+    })
+    // 读取在途期间已有回合收尾（当时因未 hydrate 跳过了落盘）：现在补一次。
+    // 仍在途则留给 finalize / failed 落盘，避免把半截回合写进去。
+    if (current.messages.length > 0 && !current.activeRunId) persistIfHydrated(characterUid)
   },
 
   sendMessage: async (characterUid, message) => {
@@ -499,9 +519,8 @@ export const useCharacterChatStore = create<CharacterChatStore>((set, get) => ({
       conversations: { ...get().conversations, [characterUid]: { ...conversation, messages, activeRunId: null } },
       runRouting,
     })
-    const projectPath = get().projectPath
     // 持久化只落 complete（失败气泡不入档），成功的用户/角色回合保留。
-    if (projectPath) persistTranscript(projectPath, characterUid, messages)
+    persistIfHydrated(characterUid)
   },
 
   cancelActiveRuns: () => {

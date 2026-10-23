@@ -392,12 +392,20 @@ describe('useCharacterChatStore', () => {
     expect(useCharacterChatStore.getState().hydratedUids).toContain('uid-a')
   })
 
-  test('restoreTranscript 不覆盖已有在途/本地消息', async () => {
-    let readCalls = 0
+  test('restoreTranscript 读回后与已有本地消息合并：磁盘历史在前、本地新消息在后，且补一次落盘', async () => {
+    const saved: Array<Record<string, unknown>> = []
     mockElectron({
-      readCharacterChatTranscript: () => {
-        readCalls += 1
-        return Promise.resolve({ projectPath: '/novels/p1', characterUid: 'uid-a', userMode: 'author', messages: [], updatedAt: 't' })
+      readCharacterChatTranscript: () =>
+        Promise.resolve({
+          projectPath: '/novels/p1',
+          characterUid: 'uid-a',
+          userMode: 'author',
+          messages: [{ id: 'old', role: 'user', text: '旧问题', status: 'complete', createdAt: 't0' }],
+          updatedAt: 't',
+        }),
+      saveCharacterChatTranscript: (input: Record<string, unknown>) => {
+        saved.push(input)
+        return Promise.resolve(input)
       },
     })
     useCharacterChatStore.setState({
@@ -412,8 +420,11 @@ describe('useCharacterChatStore', () => {
     })
 
     await useCharacterChatStore.getState().restoreTranscript('uid-a')
-    expect(readCalls).toBe(0)
-    expect(useCharacterChatStore.getState().conversations['uid-a'].messages[0].text).toBe('刚发的')
+    const texts = useCharacterChatStore.getState().conversations['uid-a'].messages.map((m) => m.text)
+    expect(texts).toEqual(['旧问题', '刚发的'])
+    expect(useCharacterChatStore.getState().conversations['uid-a'].lastUserMessage).toBe('刚发的')
+    expect(saved).toHaveLength(1)
+    expect((saved[0].messages as Array<{ text: string }>).map((m) => m.text)).toEqual(['旧问题', '刚发的'])
   })
 
   test('cancelActiveRuns 取消在途 run 并清空孤儿 activeRunId（避免重开后 composer 永久禁用）', async () => {
@@ -487,7 +498,8 @@ describe('useCharacterChatStore', () => {
       }
     })
 
-    useCharacterChatStore.setState({ projectPath: '/novels/p1', activeCharacterUid: 'uid-a' })
+    // 磁盘历史已读回（hydrated）才允许整段落盘，见 persistIfHydrated。
+    useCharacterChatStore.setState({ projectPath: '/novels/p1', activeCharacterUid: 'uid-a', hydratedUids: ['uid-a'] })
     await useCharacterChatStore.getState().sendMessage('uid-a', '在吗')
     const runId = useCharacterChatStore.getState().conversations['uid-a'].activeRunId as string
     expect(runId).not.toBeNull()
@@ -517,7 +529,8 @@ describe('useCharacterChatStore', () => {
         return Promise.resolve(input)
       },
     })
-    useCharacterChatStore.setState({ projectPath: '/novels/p1', activeCharacterUid: 'uid-a' })
+    // 磁盘历史已读回（hydrated）才允许整段落盘，见 persistIfHydrated。
+    useCharacterChatStore.setState({ projectPath: '/novels/p1', activeCharacterUid: 'uid-a', hydratedUids: ['uid-a'] })
     await useCharacterChatStore.getState().sendMessage('uid-a', '在吗')
     const runId = useCharacterChatStore.getState().conversations['uid-a'].activeRunId as string
     useCharacterChatStore.getState().applyStreamEvent({ type: 'bubble', runId, bubbleIndex: 0, text: '在的' })
@@ -540,7 +553,8 @@ describe('useCharacterChatStore', () => {
         return Promise.resolve(input)
       },
     })
-    useCharacterChatStore.setState({ projectPath: '/novels/p1', activeCharacterUid: 'uid-a' })
+    // 磁盘历史已读回（hydrated）才允许整段落盘，见 persistIfHydrated。
+    useCharacterChatStore.setState({ projectPath: '/novels/p1', activeCharacterUid: 'uid-a', hydratedUids: ['uid-a'] })
     await useCharacterChatStore.getState().sendMessage('uid-a', '在吗')
     const runId = useCharacterChatStore.getState().conversations['uid-a'].activeRunId as string
     // 失败：内存里角色气泡标 failed、保留 lastUserMessage 供重试；但持久化只落 complete。
@@ -576,5 +590,97 @@ describe('bubbleDelayMs（气泡播放节奏）', () => {
     const long = '一'.repeat(60)
     expect(bubbleDelayMs(long, false)).toBeLessThanOrEqual(2600)
     expect(bubbleDelayMs('一'.repeat(20), false)).toBeGreaterThan(bubbleDelayMs('一'.repeat(4), false))
+  })
+})
+
+describe('聊天历史读回之前发消息，不得整份覆盖磁盘历史', () => {
+  const HISTORY = [
+    { id: 'h1', role: 'user', text: '旧问题', status: 'complete', createdAt: 't0' },
+    { id: 'h2', role: 'character', text: '旧回答', status: 'complete', createdAt: 't0' },
+  ]
+
+  /** 读取 IPC 可控：gate 打开前一直挂起（模拟主进程读档慢于用户点开场快捷语）。 */
+  function setupDisk(options: { failFirstRead?: boolean } = {}) {
+    const saved: Array<{ messages: Array<{ text: string }> }> = []
+    let reads = 0
+    let openGate!: () => void
+    const gate = new Promise<void>((resolve) => {
+      openGate = resolve
+    })
+    mockElectron({
+      readCharacterChatTranscript: async (identity: Record<string, unknown>) => {
+        reads += 1
+        if (options.failFirstRead && reads === 1) throw new Error('EBUSY')
+        await gate
+        return { ...identity, messages: HISTORY, updatedAt: 't' }
+      },
+      saveCharacterChatTranscript: async (input: { messages: Array<{ text: string }> }) => {
+        saved.push(input)
+        return input
+      },
+      sendCharacterChatMessage: async (request: Record<string, unknown>) => ({ runId: request.runId }),
+    })
+    __setBubbleScheduleForTest((callback) => callback())
+    return { saved, openGate, reads: () => reads }
+  }
+
+  function finishRun(text: string): void {
+    const store = useCharacterChatStore.getState()
+    const runId = store.conversations['uid-a'].activeRunId as string
+    store.applyStreamEvent({ type: 'bubble', runId, bubbleIndex: 0, text })
+    store.applyStreamEvent({ type: 'completed', runId, text })
+  }
+
+  const texts = (messages: Array<{ text: string }>) => messages.map((message) => message.text)
+
+  test('读取在途时发送、读回后回合才结束：落盘内容是旧历史 + 新回合', async () => {
+    const disk = setupDisk()
+    const store = useCharacterChatStore.getState()
+    store.setProjectPath('/novels/p')
+    store.selectContact('uid-a')
+    await store.sendMessage('uid-a', '在吗')
+    disk.openGate()
+    await Bun.sleep(0)
+    finishRun('在')
+
+    expect(texts(disk.saved.at(-1)!.messages)).toEqual(['旧问题', '旧回答', '在吗', '在'])
+    expect(texts(useCharacterChatStore.getState().conversations['uid-a'].messages)).toEqual([
+      '旧问题',
+      '旧回答',
+      '在吗',
+      '在',
+    ])
+  })
+
+  test('读回之前回合已结束：结束时不落盘，读回合并后补一次落盘', async () => {
+    const disk = setupDisk()
+    const store = useCharacterChatStore.getState()
+    store.setProjectPath('/novels/p')
+    store.selectContact('uid-a')
+    await store.sendMessage('uid-a', '在吗')
+    finishRun('在')
+    expect(disk.saved).toHaveLength(0)
+
+    disk.openGate()
+    await Bun.sleep(0)
+    expect(disk.saved).toHaveLength(1)
+    expect(texts(disk.saved[0].messages)).toEqual(['旧问题', '旧回答', '在吗', '在'])
+  })
+
+  test('读取失败：之后的回合不落盘（不抹掉磁盘历史），再次选中联系人时重读并合并', async () => {
+    const disk = setupDisk({ failFirstRead: true })
+    disk.openGate()
+    const store = useCharacterChatStore.getState()
+    store.setProjectPath('/novels/p')
+    store.selectContact('uid-a')
+    await Bun.sleep(0)
+    await store.sendMessage('uid-a', '在吗')
+    finishRun('在')
+    expect(disk.saved).toHaveLength(0)
+
+    store.selectContact('uid-a')
+    await Bun.sleep(0)
+    expect(disk.reads()).toBe(2)
+    expect(texts(disk.saved.at(-1)!.messages)).toEqual(['旧问题', '旧回答', '在吗', '在'])
   })
 })
