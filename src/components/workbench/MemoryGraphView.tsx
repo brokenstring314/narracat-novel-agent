@@ -5,6 +5,7 @@ import { IconTooltip } from '@/components/ui/icon-tooltip'
 import { useMemoryGraph } from '@/lib/use-memory-graph'
 import { useAgentStore } from '@/lib/agent-store'
 import { cn } from '@/lib/cn'
+import { canCreateWebGL2Context } from '@/lib/webgl-support'
 import { WorkbenchEmptyState } from './WorkbenchEmptyState'
 import type { MemoryGraphSnapshot } from '@shared/types/memory-graph'
 
@@ -80,6 +81,27 @@ function MemoryGraphSummaryHud({ summary }: { summary: MemoryGraphSummary }) {
   )
 }
 
+/**
+ * 无 WebGL 时的降级说明：居中浮在星图黑底上，左上角读数照常显示。
+ * 只说清「为什么没图、怎么办」，不提供 2D 替代画布——那是另一个功能，不在崩溃修复里顺手做。
+ */
+function MemoryGraphWebglUnavailable() {
+  return (
+    <div
+      className="absolute inset-0 flex items-center justify-center px-8"
+      data-memory-graph-webgl-unavailable="true"
+    >
+      <div className="max-w-sm text-center">
+        <p className="text-sm leading-relaxed text-white/80">当前环境无法显示 3D 星图</p>
+        <p className="mt-2 text-xs leading-relaxed text-white/45">
+          {'没有可用的 WebGL（显卡加速被关闭、远程桌面或虚拟机里常见）。左上角的读数不受影响，'}
+          {'更新显卡驱动或在有显卡加速的环境里打开即可看到星图。'}
+        </p>
+      </div>
+    </div>
+  )
+}
+
 export function MemoryGraphView({
   projectPath,
   initialGraph,
@@ -101,13 +123,22 @@ export function MemoryGraphView({
   const loading = initialGraph ? false : fetched.loading
   const [fullscreen, setFullscreen] = useState(false)
   const [Canvas, setCanvas] = useState<ComponentType<MemoryGraphCanvasProps> | null>(null)
+  /** 当前环境建不出 WebGL2 上下文（无 GPU 加速）：不载入 3D 画布，改显示降级说明。 */
+  const [webglUnavailable, setWebglUnavailable] = useState(false)
 
   const summary = memoryGraphSummary(graph)
   const hasGraph = summary.characters > 0
 
   // 画布按需载入：只有真有内容要画时才拉 three.js chunk。载入失败保持占位，不炸整页。
+  // 无 WebGL 时 three.js 的 WebGLRenderer 会在挂载时直接 throw，卸载整个 #root（整窗白屏），
+  // 而导航状态会记住本页，刷新/重启都回到这里——所以先探测，拿不到上下文就不载入画布。
   useEffect(() => {
-    if (!hasGraph || Canvas) return
+    if (!hasGraph || Canvas || webglUnavailable) return
+    if (!canCreateWebGL2Context()) {
+      console.warn('[memory-graph] 当前环境无法创建 WebGL2 上下文，星图改为降级展示。')
+      setWebglUnavailable(true)
+      return
+    }
     let cancelled = false
     import('./MemoryGraphCanvas')
       .then((module) => {
@@ -119,7 +150,7 @@ export function MemoryGraphView({
     return () => {
       cancelled = true
     }
-  }, [hasGraph, Canvas])
+  }, [hasGraph, Canvas, webglUnavailable])
 
   // 全屏时按 ESC 退出
   useEffect(() => {
@@ -158,6 +189,7 @@ export function MemoryGraphView({
       {/* 画布满幅铺开，信息与操作都浮在它之上——不切出工具栏与页脚，星图本身才是主体 */}
       <div className="relative min-h-0 flex-1" data-memory-graph-canvas-slot="true">
         {Canvas ? <Canvas graph={graph} projectPath={projectPath} /> : null}
+        {webglUnavailable ? <MemoryGraphWebglUnavailable /> : null}
 
         <MemoryGraphSummaryHud summary={summary} />
 
