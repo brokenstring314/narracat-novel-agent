@@ -2,8 +2,9 @@
 // Vendored from React Bits «Threads». 改动：TypeScript 化、容器样式改 Tailwind、命名导出、默认色改品牌绿、
 // 并把线宽/线数/模糊从 shader const 提成 uniform（dev 可调）。
 import { useEffect, useRef } from 'react'
-import { Color, Mesh, Program, Renderer, Triangle } from 'ogl'
+import { Color, Mesh, Program, Triangle } from 'ogl'
 import { cn } from '@/lib/cn'
+import { createRendererOrNull } from './ogl-renderer'
 
 const vertexShader = `
 attribute vec2 position;
@@ -156,7 +157,11 @@ export function Threads({
     const container = containerRef.current
     if (!container) return
 
-    const renderer = new Renderer({ alpha: true })
+    // 无 WebGL（--disable-gpu / GPU 被拉黑 / 远程桌面）时不画，留空白底，见 ogl-renderer.ts
+    const maybeRenderer = createRendererOrNull({ alpha: true })
+    if (!maybeRenderer) return
+    // 另起一个非空常量：下面的 resize/update 是函数声明（会提升），TS 不把上面的判空收窄带进去
+    const renderer = maybeRenderer
     const gl = renderer.gl
     gl.clearColor(0, 0, 0, 0)
     gl.enable(gl.BLEND)

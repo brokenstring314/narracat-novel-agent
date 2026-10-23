@@ -2,8 +2,9 @@
 // Vendored from React Bits «CircularGallery». 改动：① TypeScript 化；② 去掉远程字体加载（onboarding 用系统字体即可）；
 // ③ 去掉键盘监听（避免与首次介绍的方向键推进冲突）；④ 容器样式改用 Tailwind。WebGL 引擎逻辑忠于上游。
 import { useEffect, useRef } from 'react'
-import { Camera, Mesh, Plane, Program, Renderer, Texture, Transform } from 'ogl'
+import { Camera, Mesh, Plane, Program, Texture, Transform, type Renderer } from 'ogl'
 import { cn } from '@/lib/cn'
+import { createRendererOrNull } from './ogl-renderer'
 
 export interface CircularGalleryItem {
   image: string
@@ -361,6 +362,7 @@ class App {
 
   constructor(
     container: HTMLElement,
+    renderer: Renderer,
     {
       items,
       bend,
@@ -376,7 +378,7 @@ class App {
     this.scrollSpeed = scrollSpeed
     this.scroll = { ease: scrollEase, current: 0, target: 0, last: 0 }
     this.onCheckDebounce = debounce(this.onCheck, 200)
-    this.createRenderer()
+    this.createRenderer(renderer)
     this.createCamera()
     this.createScene()
     this.onResize()
@@ -386,8 +388,8 @@ class App {
     this.addEventListeners()
   }
 
-  createRenderer() {
-    this.renderer = new Renderer({ alpha: true, antialias: true, dpr: Math.min(window.devicePixelRatio || 1, 2) })
+  createRenderer(renderer: Renderer) {
+    this.renderer = renderer
     this.gl = this.renderer.gl
     this.gl.clearColor(0, 0, 0, 0)
     this.container.appendChild(this.gl.canvas)
@@ -533,7 +535,11 @@ export function CircularGallery({
 
   useEffect(() => {
     if (!containerRef.current) return
-    const app = new App(containerRef.current, {
+    // 渲染器在 App 外面建：无 WebGL（--disable-gpu / GPU 被拉黑 / 远程桌面）时整个画廊不起，
+    // 留空容器，不把异常抛进 React，见 ogl-renderer.ts
+    const renderer = createRendererOrNull({ alpha: true, antialias: true, dpr: Math.min(window.devicePixelRatio || 1, 2) })
+    if (!renderer) return
+    const app = new App(containerRef.current, renderer, {
       items,
       bend,
       textColor,

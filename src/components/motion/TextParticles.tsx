@@ -2,8 +2,9 @@
 // 基于 React Bits «Particles»（ogl）的运动（3D 球内漂浮 + 旋转），但把圆点换成中文字符：
 // 用字符 atlas 纹理，每个 POINT 按 charIndex 采样对应汉字。营造“一百万字”意象。
 import { useEffect, useRef } from 'react'
-import { Camera, Geometry, Mesh, Program, Renderer, Texture } from 'ogl'
+import { Camera, Geometry, Mesh, Program, Texture } from 'ogl'
 import { cn } from '@/lib/cn'
+import { createRendererOrNull } from './ogl-renderer'
 
 const GLYPHS = Array.from(
   '故事人间风云山海剑心魂梦字章节伏笔情仇生死爱恨悲欢离合江湖庙堂少年红颜白发苍生天地玄黄星辰大海笔墨春秋花月刀光剑影侠骨柔肠恩怨情长岁月山河朝暮诗书礼乐忠义仁勇生灵万象',
@@ -128,7 +129,9 @@ export function TextParticles({
     const container = containerRef.current
     if (!container) return
 
-    const renderer = new Renderer({ dpr: Math.min(window.devicePixelRatio || 1, 2), depth: false, alpha: true })
+    // 无 WebGL 时不画，见 ogl-renderer.ts
+    const renderer = createRendererOrNull({ dpr: Math.min(window.devicePixelRatio || 1, 2), depth: false, alpha: true })
+    if (!renderer) return
     const gl = renderer.gl
     container.appendChild(gl.canvas)
     gl.clearColor(0, 0, 0, 0)
