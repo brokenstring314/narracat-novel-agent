@@ -5,7 +5,7 @@ import { GlobalRegistrator } from '@happy-dom/global-registrator'
 GlobalRegistrator.register()
 
 const { afterAll, afterEach, describe, expect, test } = await import('bun:test')
-const { canCreateWebGL2Context } = await import('./webgl-support')
+const { canCreateWebGL2Context, canCreateWebGLContext } = await import('./webgl-support')
 
 const originalGetContext = HTMLCanvasElement.prototype.getContext
 
@@ -45,5 +45,31 @@ describe('canCreateWebGL2Context', () => {
       throw new Error('context creation blocked')
     })
     expect(canCreateWebGL2Context()).toBe(false)
+  })
+})
+
+describe('canCreateWebGLContext（介绍页 ogl 动效用）', () => {
+  const fakeGl = { getExtension: () => null }
+
+  test('webgl2 拿不到但 webgl1 拿得到 → true（与 ogl Renderer 回退顺序一致）', () => {
+    const requested: string[] = []
+    stubGetContext((contextId) => {
+      requested.push(contextId)
+      return contextId === 'webgl' ? fakeGl : null
+    })
+    expect(canCreateWebGLContext()).toBe(true)
+    expect(requested).toEqual(['webgl2', 'webgl'])
+  })
+
+  test('两种上下文都拿不到 → false', () => {
+    stubGetContext(() => null)
+    expect(canCreateWebGLContext()).toBe(false)
+  })
+
+  test('getContext 本身抛错 → false，不向外抛', () => {
+    stubGetContext(() => {
+      throw new Error('context creation blocked')
+    })
+    expect(canCreateWebGLContext()).toBe(false)
   })
 })

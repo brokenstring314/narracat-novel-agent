@@ -10,6 +10,7 @@ import { Threads } from '@/components/motion/Threads'
 import { TextParticles } from '@/components/motion/TextParticles'
 import { CircularGallery } from '@/components/motion/CircularGallery'
 import { characterGalleryItems, hasCharacterImages } from './character-gallery'
+import { canCreateWebGLContext } from '@/lib/webgl-support'
 
 // 与 globals.css 的 slide-up-fade 同一条出场曲线。
 const REVEAL_EASE = [0.16, 1, 0.3, 1] as const
@@ -62,6 +63,8 @@ const AnimationDebugPanel = import.meta.env.DEV
   : null
 
 function StepContent({ step, reduced, params }: { step: number; reduced: boolean; params: StageParams }) {
+  // 只在挂载时探测一次；与 ogl Renderer 一样先试 webgl2 再试 webgl1。
+  const [webglOk] = useState(canCreateWebGLContext)
   // 序幕·理念
   if (step === 0) {
     const m = params.manifesto
@@ -133,8 +136,8 @@ function StepContent({ step, reduced, params }: { step: number; reduced: boolean
           className="justify-center text-2xl font-semibold text-foreground sm:text-3xl"
         />
         {hasCharacterImages ? (
-          reduced ? (
-            // reduced-motion：静态角色图网格，不跑画廊的持续 WebGL 动画。
+          reduced || !webglOk ? (
+            // reduced-motion 或无 WebGL：静态角色图网格，不跑画廊的 WebGL 动画（无 WebGL 时画廊建不出画布，会留一片空白）。
             <div className="flex w-full max-w-4xl flex-wrap items-end justify-center gap-4 px-6">
               {characterGalleryItems.slice(0, 6).map((item, i) => (
                 <figure key={i} className="flex flex-col items-center gap-2">

@@ -18,3 +18,22 @@ export function canCreateWebGL2Context(): boolean {
     return false
   }
 }
+
+/**
+ * 探测能否建出任意 WebGL 上下文（先 webgl2，再 webgl1）。
+ *
+ * 与 ogl 的 Renderer 取上下文的顺序一致，用于介绍页的 ogl 动效：拿不到就直接走静态展示，
+ * 不等 renderer 创建失败后留下空白区域。探测用的上下文随即释放。
+ */
+export function canCreateWebGLContext(): boolean {
+  if (typeof document === 'undefined') return false
+  try {
+    const canvas = document.createElement('canvas')
+    const gl = canvas.getContext('webgl2') ?? canvas.getContext('webgl')
+    if (!gl) return false
+    gl.getExtension('WEBGL_lose_context')?.loseContext()
+    return true
+  } catch {
+    return false
+  }
+}
