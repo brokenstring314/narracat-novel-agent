@@ -10,6 +10,12 @@ vi.mock("../utils/embedding.js", () => ({
   embed: vi.fn(async () => null),
 }));
 
+// 透传真实实现，只为让个别用例能注入「进度回退失败」
+vi.mock("./state-sync.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./state-sync.js")>();
+  return { ...actual, revertProgressToChapter: vi.fn(actual.revertProgressToChapter) };
+});
+
 import { initSchema } from "../migrate.js";
 import { auditForeshadowingLifecycle, formatForeshadowingLifecycleAuditReport } from "../foreshadowing-audit.js";
 import type { ToolContext } from "../types.js";
@@ -29,7 +35,7 @@ import {
   backfillReviewArtifacts,
   novelSubmitDialogueSamples,
 } from "./writers.js";
-import { stagingManuscriptPath } from "./state-sync.js";
+import { stagingManuscriptPath, revertProgressToChapter } from "./state-sync.js";
 import { validateOutlineBookPayload } from "./validators.js";
 
 function loadFixture<T>(name: string): T {
@@ -2766,6 +2772,63 @@ describe("novel_rollback_chapter mode=reconcile-chapter（重写中间章只动�
     expect(factRows(db)).toHaveLength(6);
     const state = parse(readFileSync(join(root, ".narracat", "state.yaml"), "utf-8"));
     expect(state.progress.completed_chapters).toEqual([1, 2, 3, 4]);
+  });
+
+  it("进度落后于正文（后文章正文与记忆都在、却不在完成进度里）→ 默认区间回滚拒绝，不删后文记忆", async () => {
+    const { ctx, root, db } = await buildFourChapterBook();
+    writeCompletedState(root, [1, 2]);
+
+    const result = (await novelRollbackChapter({ chapter: 2 }, ctx)) as Record<string, unknown>;
+
+    expect(result.ok).toBe(false);
+    expect(JSON.stringify(result)).toContain("第 3–4 章");
+    expect(summaryChapters(db)).toEqual([1, 2, 3, 4]);
+    expect(factRows(db)).toHaveLength(6);
+    expect(existsSync(join(root, ".narracat", "receipts", "ch-003.json"))).toBe(true);
+    const state = parse(readFileSync(join(root, ".narracat", "state.yaml"), "utf-8"));
+    expect(state.progress.completed_chapters).toEqual([1, 2]);
+  });
+
+  it.each([
+    ["损坏", (path: string) => writeFileSync(path, "progress: [unclosed\n  : : :\n")],
+    ["缺失", (path: string) => rmSync(path)],
+  ])("state.yaml %s → 默认区间回滚拒绝，不动任何记忆", async (_label, breakState) => {
+    const { ctx, root, db } = await buildFourChapterBook();
+    breakState(join(root, ".narracat", "state.yaml"));
+
+    const result = (await novelRollbackChapter({ chapter: 2 }, ctx)) as Record<string, unknown>;
+
+    expect(result.ok).toBe(false);
+    expect(JSON.stringify(result)).toContain("state.yaml");
+    expect(summaryChapters(db)).toEqual([1, 2, 3, 4]);
+    expect(factRows(db)).toHaveLength(6);
+    expect(existsSync(join(root, ".narracat", "receipts", "ch-002.json"))).toBe(true);
+  });
+
+  it("后文章只有记忆、正文不在正式路径（写章收尾中断）→ 同步最末完成章照旧放行并清掉这份残留记忆", async () => {
+    const { ctx, root, db } = await buildFourChapterBook();
+    writeCompletedState(root, [1, 2, 3]);
+    rmSync(join(root, "manuscript", "vol-01", "ch-004.md"));
+
+    const result = (await novelRollbackChapter({ chapter: 3 }, ctx)) as Record<string, unknown>;
+
+    expect(result.ok).toBe(true);
+    expect(summaryChapters(db)).toEqual([1, 2]);
+    const state = parse(readFileSync(join(root, ".narracat", "state.yaml"), "utf-8"));
+    expect(state.progress.completed_chapters).toEqual([1, 2]);
+  });
+
+  it("记忆已清但进度回退失败 → 返回 ok:false + partial，不报假绿", async () => {
+    const { ctx, db } = await buildFourChapterBook();
+    vi.mocked(revertProgressToChapter).mockResolvedValueOnce({ ok: false, error: "写入 state.yaml 失败" });
+
+    const result = (await novelRollbackChapter({ chapter: 4 }, ctx)) as Record<string, unknown>;
+
+    expect(result.ok).toBe(false);
+    expect(result.partial).toBe(true);
+    expect(result.state_progress_reverted).toBe(false);
+    expect(JSON.stringify(result.errors)).toContain("写入 state.yaml 失败");
+    expect(summaryChapters(db)).toEqual([1, 2, 3]);
   });
 
   it("默认区间回滚对最末完成章照旧可用（作者手改最末章同步记忆的链路不受影响）", async () => {

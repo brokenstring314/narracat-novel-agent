@@ -32,6 +32,9 @@ function setup(): ToolContext {
   const root = mkdtempSync(join(tmpdir(), "g4b-"));
   cleanup.push(root);
   mkdirSync(join(root, "bible", "characters"), { recursive: true });
+  // 区间回滚要求 state.yaml 可读（读不了即拒绝），真实项目由 init 建好
+  mkdirSync(join(root, ".narracat"), { recursive: true });
+  writeFileSync(join(root, ".narracat", "state.yaml"), "progress:\n  completed_chapters: []\n");
   writeFileSync(
     join(root, "bible", "characters", "林晚.md"),
     `<!-- character_identity: {"character_uid":"${UID}","name":"林晚"} -->\n# 林晚\n`,

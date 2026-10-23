@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initSchema } from "../migrate.js";
@@ -17,7 +17,11 @@ import type { ToolContext } from "../types.js";
 function makeCtx(): ToolContext {
   const db = new Database(":memory:");
   initSchema(db);
-  return { novelId: "n1", db, projectRoot: mkdtempSync(join(tmpdir(), "authored-state-tool-")) } as ToolContext;
+  const projectRoot = mkdtempSync(join(tmpdir(), "authored-state-tool-"));
+  // 区间回滚要求 state.yaml 可读（读不了即拒绝），真实项目由 init 建好
+  mkdirSync(join(projectRoot, ".narracat"), { recursive: true });
+  writeFileSync(join(projectRoot, ".narracat", "state.yaml"), "progress:\n  completed_chapters: []\n");
+  return { novelId: "n1", db, projectRoot } as ToolContext;
 }
 
 async function submitVocab(ctx: ToolContext): Promise<void> {

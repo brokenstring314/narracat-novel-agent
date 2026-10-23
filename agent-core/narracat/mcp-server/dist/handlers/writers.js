@@ -27,7 +27,7 @@ import { loadStateVocabulary } from "./state-dimensions.js";
 import { mirrorChapterPlannedState } from "./planned-state.js";
 import { buildBenchmarkNote } from "./grid-benchmark.js";
 import { narratorAddressPhrase } from "./narrator-address.js";
-import { writeStructureToState, checkReviewFreshness, checkManuscriptContract, resolveWorkingManuscript, countWords, visibleBodyText, extractManuscriptSnippets, chapterFileSegment, volumeDirSegment, revertProgressToChapter, readCompletedChapters, } from "./state-sync.js";
+import { writeStructureToState, checkReviewFreshness, checkManuscriptContract, resolveWorkingManuscript, countWords, visibleBodyText, extractManuscriptSnippets, chapterFileSegment, volumeDirSegment, revertProgressToChapter, readCompletedChapters, scanManuscripts, } from "./state-sync.js";
 import { errorResponse, singleError } from "../types.js";
 import { loadAliasMap, normalizeName, resolveCharacterUid, relationshipSubject, } from "./alias-map.js";
 /** 查最早的已兑现 plant（status='realized'），用于 plant→develop 矫正 */
@@ -2231,10 +2231,27 @@ export async function novelRollbackChapter(args, ctx) {
     }
     if (mode === "reconcile-chapter")
         return reconcileSingleChapter(ctx, chapter);
+    // 护栏：区间回滚只许清「后面没有已写成章」的尾部。state.yaml 读不了就无从判断，拒绝而不是放行；
+    // 进度可能落后于正文（并发写丢进度、旧版本遗留），所以除了完成进度，再认一条「正文已正式落盘
+    // 且记忆库里有它的摘要 / 事实」——这样的章同样算已写成，不能被一次尾章同步顺手删光。
+    // 只有记忆、没有正式正文的后文章（写章收尾中断：记忆已入库、正文还在草稿区）不拦，照旧随回滚清掉。
     const completedNow = await readCompletedChapters(ctx.projectRoot);
-    const laterCompleted = completedNow.ok ? completedNow.chapters.filter((c) => c > chapter) : [];
+    if (!completedNow.ok) {
+        return singleError("state.yaml", "可读的完成进度", "不可用", `${completedNow.error}。无法确认第${chapter}章之后有没有已完成章，区间回滚本次未做任何修改；先修复 state.yaml 再重试。`);
+    }
+    const manuscriptChapters = new Set((await scanManuscripts(ctx.projectRoot)).map((m) => m.chapter).filter((c) => c > chapter));
+    const laterWithMemory = ctx.db
+        .prepare(`SELECT chapter FROM chapter_summaries WHERE novel_id = ? AND chapter > ?
+         UNION SELECT from_chapter FROM facts WHERE novel_id = ? AND from_chapter > ?`)
+        .all(ctx.novelId, chapter, ctx.novelId, chapter).map((r) => r.chapter);
+    const laterCompleted = [
+        ...new Set([
+            ...completedNow.chapters.filter((c) => c > chapter),
+            ...laterWithMemory.filter((c) => manuscriptChapters.has(c)),
+        ]),
+    ].sort((a, b) => a - b);
     if (laterCompleted.length > 0) {
-        return singleError("mode", '后面没有已完成章，或 mode="reconcile-chapter"', `${describeChapters(laterCompleted)}已完成`, `区间回滚会删掉${describeChapters(laterCompleted)}的记忆并回退进度，本次未做任何修改。只重写第${chapter}章请改用 mode="reconcile-chapter"。`);
+        return singleError("mode", '后面没有已完成章，或 mode="reconcile-chapter"', `${describeChapters(laterCompleted)}已写成（在完成进度里，或正文与记忆都已入库）`, `区间回滚会删掉${describeChapters(laterCompleted)}的记忆并回退进度，本次未做任何修改。只重写第${chapter}章请改用 mode="reconcile-chapter"。`);
     }
     let deletedSummaries = 0;
     let deletedFacts = 0;
@@ -2362,8 +2379,23 @@ export async function novelRollbackChapter(args, ctx) {
     const stateNote = stateRevert.ok
         ? `进度已回退（完成 ${stateRevert.completed_chapters.length} 章，总字数 ${stateRevert.word_count_total}）`
         : `state.yaml 进度回退失败：${stateRevert.error}`;
+    // 记忆已删、进度没退：不是成功，按失败返回并标 partial，调用方据此停下而不是当作已回滚继续
+    const failure = stateRevert.ok
+        ? {}
+        : {
+            partial: true,
+            errors: [
+                {
+                    field: "state.yaml",
+                    expected: `进度回退到第${chapter}章之前`,
+                    actual: "回退失败",
+                    hint: `第${chapter}章及之后的记忆已清除，但完成进度没有回退：${stateRevert.error}`,
+                },
+            ],
+        };
     return {
-        ok: true,
+        ok: stateRevert.ok,
+        ...failure,
         from_chapter: chapter,
         deleted: {
             chapter_summaries: deletedSummaries,

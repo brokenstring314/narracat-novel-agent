@@ -26,6 +26,9 @@ function makeCtx({ committed = true }: { committed?: boolean } = {}): ToolContex
   const root = mkdtempSync(join(tmpdir(), "style-anchor-"));
   cleanupPaths.push(root);
   mkdirSync(join(root, "manuscript", "vol-01"), { recursive: true });
+  // 区间回滚要求 state.yaml 可读（读不了即拒绝），真实项目由 init 建好
+  mkdirSync(join(root, ".narracat"), { recursive: true });
+  writeFileSync(join(root, ".narracat", "state.yaml"), "progress:\n  completed_chapters: []\n");
   writeFileSync(join(root, "manuscript", "vol-01", "ch-001.md"), `# 第一章 开局\n\n${PARA}\n\n又一段。\n`);
   const db = new Database(join(root, "memory.db"));
   initSchema(db); // 单参数签名
