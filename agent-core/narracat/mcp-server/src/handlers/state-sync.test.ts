@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -666,6 +666,70 @@ describe("novel_checkpoint", () => {
       unknown
     >;
     expect(result["ok"]).toBe(false);
+  });
+});
+
+// 同一条消息里的多个工具调用会并发执行（agent 循环默认并行 + memory worker 收到即处理不排队），
+// 每个写 state.yaml 的工具都是「读整份 → 中途多次 await 扫正文 → 整份写回」。不串行时后写的一份
+// 会把先写的整份盖掉：几次调用各自报成功，磁盘上却只剩最后一次的改动。
+describe("state.yaml 并发写不丢更新", () => {
+  it("并发恢复第 1、2、3 章进度，三章全部落盘", async () => {
+    const { ctx, root, statePath } = createProject();
+    for (const chapter of [1, 2, 3]) writeManuscript(root, chapter);
+
+    const results = (await Promise.all(
+      [1, 2, 3].map((chapter) => novelRestoreProgress({ chapter }, ctx)),
+    )) as Record<string, unknown>[];
+
+    expect(results.every((r) => r.ok === true)).toBe(true);
+    const state = parse(await readFile(statePath, "utf-8"));
+    expect(state.progress.completed_chapters).toEqual([1, 2, 3]);
+    expect(state.progress.last_completed_chapter).toBe(3);
+    expect(Object.keys(state.word_count.by_chapter).map(Number)).toEqual([1, 2, 3]);
+  });
+
+  it("并发写断点与恢复进度，两边的改动都保留", async () => {
+    const { ctx, root, statePath } = createProject();
+    writeManuscript(root, 1);
+
+    const [progress, checkpoint] = (await Promise.all([
+      novelRestoreProgress({ chapter: 1 }, ctx),
+      novelCheckpoint({ command: "write", step: 1, chapter: 2 }, ctx),
+    ])) as Record<string, unknown>[];
+
+    expect(progress.ok).toBe(true);
+    expect(checkpoint.ok).toBe(true);
+    const state = parse(await readFile(statePath, "utf-8"));
+    expect(state.progress.completed_chapters).toEqual([1]);
+    expect(state.checkpoint.last_command).toBe("write 2");
+  });
+
+  it("并发同步结构与恢复进度，structure 节与进度都保留", async () => {
+    const { ctx, root, statePath } = createProject();
+    writeManuscript(root, 1);
+
+    const [progress, structure] = (await Promise.all([
+      novelRestoreProgress({ chapter: 1 }, ctx),
+      novelSyncStructure(validArgs(), ctx),
+    ])) as Record<string, unknown>[];
+
+    expect(progress.ok).toBe(true);
+    expect(structure.ok).toBe(true);
+    const state = parse(await readFile(statePath, "utf-8"));
+    expect(state.progress.completed_chapters).toEqual([1]);
+    expect(state.structure.total_chapters_planned).toBe(5);
+  });
+
+  it("写入后 .narracat 目录不残留临时文件", async () => {
+    const { ctx, root } = createProject();
+    writeManuscript(root, 1);
+
+    await Promise.all([
+      novelRestoreProgress({ chapter: 1 }, ctx),
+      novelCheckpoint({ command: "write", step: 1, chapter: 2 }, ctx),
+    ]);
+
+    expect(await readdir(join(root, ".narracat"))).toEqual(["state.yaml"]);
   });
 });
 

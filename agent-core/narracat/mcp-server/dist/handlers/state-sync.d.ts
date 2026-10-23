@@ -8,6 +8,8 @@
  * - novel_checkpoint      : 机械写 checkpoint 节
  *
  * 写入一律 read-modify-write：解析整份 state.yaml，只改目标节，其余节原样保留。
+ * 同一项目的读改写经 withStateLock 串行（中途有 await，并发调用会互相整份覆盖），
+ * 落盘经 writeStateFile 先写临时文件再 rename，读者只会看到完整的旧文件或新文件。
  *
  * 与 writers.ts 的边界：writers 写 memory.db 与渲染产物，本模块写小说项目状态文件，
  * 不触碰数据库。writers 的 novel_submit_outline 通过本模块的 writeStructureToState

@@ -8,6 +8,8 @@
  * - novel_checkpoint      : 机械写 checkpoint 节
  *
  * 写入一律 read-modify-write：解析整份 state.yaml，只改目标节，其余节原样保留。
+ * 同一项目的读改写经 withStateLock 串行（中途有 await，并发调用会互相整份覆盖），
+ * 落盘经 writeStateFile 先写临时文件再 rename，读者只会看到完整的旧文件或新文件。
  *
  * 与 writers.ts 的边界：writers 写 memory.db 与渲染产物，本模块写小说项目状态文件，
  * 不触碰数据库。writers 的 novel_submit_outline 通过本模块的 writeStructureToState
@@ -15,8 +17,8 @@
  */
 
 import { readFile, writeFile, readdir, access, mkdir, rename, rm } from "node:fs/promises";
-import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { join, resolve } from "node:path";
 import { parseDocument, Document } from "yaml";
 import type { ToolContext, ToolErrorItem } from "../types.js";
 import { errorResponse, singleError } from "../types.js";
@@ -416,6 +418,42 @@ export async function novelCheckManuscriptContract(
   };
 }
 
+/**
+ * 同一项目的 state.yaml 读改写串行队列（按 projectRoot 一条 promise 链）。
+ * 读改写之间要扫描并读取全部正文，多次 await；同一条消息里的多个工具调用会并发执行，
+ * 不串行时后写的一份把先写的整份盖掉——几次调用都报成功，磁盘只剩最后一次的改动。
+ * 只管本进程内的并发（App 为每个小说项目只起一个长驻引擎 worker）。
+ */
+const stateWriteQueues = new Map<string, Promise<void>>();
+
+async function withStateLock<T>(projectRoot: string, task: () => Promise<T>): Promise<T> {
+  const key = resolve(projectRoot);
+  const previous = stateWriteQueues.get(key) ?? Promise.resolve();
+  const run = previous.then(task);
+  const settled = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  stateWriteQueues.set(key, settled);
+  try {
+    return await run;
+  } finally {
+    if (stateWriteQueues.get(key) === settled) stateWriteQueues.delete(key);
+  }
+}
+
+/** 同目录临时文件 + rename 整体替换：写到一半崩溃也不会留下截断的 state.yaml */
+async function writeStateFile(statePath: string, content: string): Promise<void> {
+  const tmpPath = `${statePath}.tmp-${randomUUID()}`;
+  try {
+    await writeFile(tmpPath, content, "utf-8");
+    await rename(tmpPath, statePath);
+  } catch (error) {
+    await rm(tmpPath, { force: true });
+    throw error;
+  }
+}
+
 async function loadStateDocument(
   projectRoot: string,
 ): Promise<{ doc: Document; statePath: string } | { error: string }> {
@@ -612,6 +650,17 @@ export async function writeStructureToState(
   totalChaptersPlanned: number,
   chapterToVolume: Map<number, number>,
 ): Promise<{ ok: true } | { ok: false; message: string }> {
+  return withStateLock(projectRoot, () =>
+    writeStructureToStateLocked(projectRoot, totalVolumes, totalChaptersPlanned, chapterToVolume),
+  );
+}
+
+async function writeStructureToStateLocked(
+  projectRoot: string,
+  totalVolumes: number,
+  totalChaptersPlanned: number,
+  chapterToVolume: Map<number, number>,
+): Promise<{ ok: true } | { ok: false; message: string }> {
   const loaded = await loadStateDocument(projectRoot);
   if ("error" in loaded) return { ok: false, message: loaded.error };
   const { doc, statePath } = loaded;
@@ -633,7 +682,7 @@ export async function writeStructureToState(
     ),
   );
 
-  await writeFile(statePath, String(doc), "utf-8");
+  await writeStateFile(statePath, String(doc));
   return { ok: true };
 }
 
@@ -808,6 +857,16 @@ async function applyProgressUpdate(
   | { ok: false; error: string }
   | { ok: true; completed: number[]; lastCompleted: number; total: number }
 > {
+  return withStateLock(ctx.projectRoot, () => applyProgressUpdateLocked(chapter, ctx));
+}
+
+async function applyProgressUpdateLocked(
+  chapter: number,
+  ctx: ToolContext,
+): Promise<
+  | { ok: false; error: string }
+  | { ok: true; completed: number[]; lastCompleted: number; total: number }
+> {
   const loaded = await loadStateDocument(ctx.projectRoot);
   if ("error" in loaded) {
     return { ok: false, error: loaded.error };
@@ -853,7 +912,7 @@ async function applyProgressUpdate(
   // 清 checkpoint（别的章写到一半的中断记录保留，见 clearCheckpointKeepingPendingWrite）
   clearCheckpointKeepingPendingWrite(doc);
 
-  await writeFile(statePath, String(doc), "utf-8");
+  await writeStateFile(statePath, String(doc));
 
   return { ok: true, completed, lastCompleted, total };
 }
@@ -993,6 +1052,15 @@ export async function novelCheckpoint(
     );
   }
 
+  return withStateLock(ctx.projectRoot, () => writeCheckpointLocked(command, step, chapter, ctx));
+}
+
+async function writeCheckpointLocked(
+  command: string,
+  step: number | string,
+  chapter: unknown,
+  ctx: ToolContext,
+): Promise<unknown> {
   const loaded = await loadStateDocument(ctx.projectRoot);
   if ("error" in loaded) {
     return singleError("state.yaml", "可读写的合法 YAML", "不可用", loaded.error);
@@ -1019,7 +1087,7 @@ export async function novelCheckpoint(
   doc.setIn(["checkpoint", "last_step"], step);
   doc.setIn(["checkpoint", "timestamp"], timestamp);
 
-  await writeFile(statePath, String(doc), "utf-8");
+  await writeStateFile(statePath, String(doc));
 
   return {
     ok: true,
@@ -1067,6 +1135,16 @@ export async function revertProgressToChapter(
   | { ok: true; completed_chapters: number[]; word_count_total: number }
   | { ok: false; error: string }
 > {
+  return withStateLock(projectRoot, () => revertProgressToChapterLocked(projectRoot, chapter));
+}
+
+async function revertProgressToChapterLocked(
+  projectRoot: string,
+  chapter: number,
+): Promise<
+  | { ok: true; completed_chapters: number[]; word_count_total: number }
+  | { ok: false; error: string }
+> {
   const loaded = await loadStateDocument(projectRoot);
   if ("error" in loaded) {
     return { ok: false, error: loaded.error };
@@ -1104,7 +1182,7 @@ export async function revertProgressToChapter(
   // 清 checkpoint（回滚后旧断点不再有效；别的章写到一半的中断记录保留）
   clearCheckpointKeepingPendingWrite(doc);
 
-  await writeFile(statePath, String(doc), "utf-8");
+  await writeStateFile(statePath, String(doc));
 
   return { ok: true, completed_chapters: completed, word_count_total: total };
 }
